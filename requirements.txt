@@ -1,0 +1,7 @@
+streamlit>=1.20.0
+matplotlib>=3.5
+mplsoccer>=0.6.0
+pandas>=1.5
+numpy>=1.23
+Pillow>=9.0
+streamlit-image-coordinates>=0.0.4
