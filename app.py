@@ -1,4 +1,4 @@
-# Action Map + xT (updated: top-20 ΔxT highlighted, rest gray, failures red)
+# name=pass_map_actions_xt_clean.py
 import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
@@ -16,7 +16,7 @@ from matplotlib.colors import Normalize, LinearSegmentedColormap
 # ==========================
 # Page Configuration
 # ==========================
-st.set_page_config(layout="wide", page_title="Action Map Dashboard (Actions + xT)")
+st.set_page_config(layout="wide", page_title="Action Map — Clean (Actions + xT)")
 
 # ==========================
 # CSS
@@ -89,7 +89,6 @@ st.markdown(
       margin: 14px 0;
     }
 
-    /* Make Streamlit subheaders slightly lighter on dark bg when we still use them */
     .stSubheader { color: #ffffff !important; }
     </style>
     """,
@@ -111,7 +110,7 @@ def small_metric(label: str, value: str, delta: str | None = None):
 # ==========================
 # Configuration / constants
 # ==========================
-st.title("Action Map Dashboard")
+st.title("Action Map — Clean (Actions + xT)")
 
 FIELD_X, FIELD_Y = 120.0, 80.0
 HALF_LINE_X = FIELD_X / 2
@@ -121,14 +120,17 @@ LANE_LEFT_MIN = 53.33
 LANE_RIGHT_MAX = 26.67
 
 NX, NY = 16, 12
-
 LATERAL_MIN_DIST = 12.0
 
 # Colours
 COLOR_TOP = "#2F80ED"        # top ΔxT (blue)
-COLOR_OTHER = "#c8cbd1"      # other successful (light gray)
-COLOR_FAIL = "#FF6B6B"       # failed (lighter red)
-COLOR_BG_SUCCESS = "#ffffff" # unused, kept for compatibility
+COLOR_OTHER = "#bfc4ca"      # other successful (light gray)
+COLOR_FAIL = "#FF6B6B"       # failed (light red)
+
+# Draw sizes
+START_DOT_SIZE = 30  # decreased
+FIG_W, FIG_H = 7.9, 5.3
+FIG_DPI = 110
 
 # ==========================
 # xT GRID
@@ -154,7 +156,7 @@ def xt_value(x, y):
     return XT_GRID[iy, ix]
 
 # ==========================
-# DATA (REPLACED WITH USER EVENTS: actions start -> end)
+# DATA (user-provided actions)
 # ==========================
 matches_data = {
     "Ali vs Vancouver": [
@@ -287,14 +289,6 @@ matches_data = {
 def has_video_value(v) -> bool:
     return pd.notna(v) and str(v).strip() != ""
 
-def get_lane(y):
-    if y >= LANE_LEFT_MIN:
-        return "left"
-    elif y < LANE_RIGHT_MAX:
-        return "right"
-    else:
-        return "center"
-
 def classify_action_direction(x_start, y_start, x_end, y_end) -> str:
     dx = x_end - x_start
     dy = y_end - y_start
@@ -321,13 +315,13 @@ for match_name, events in matches_data.items():
     dfm["number"] = np.arange(1, len(dfm) + 1)
     dfm["is_won"] = dfm["type"].str.contains("WON", case=False)
     dfm["outcome"] = np.where(dfm["is_won"], "successful", "failed")
-    # remove progressive/switch logic since this is an actions map focused on ΔxT
     dfm["direction"] = dfm.apply(lambda row: classify_action_direction(row["x_start"], row["y_start"], row["x_end"], row["y_end"]), axis=1)
     dfm["is_forward"] = dfm["direction"] == "forward"
     dfm["is_backward"] = dfm["direction"] == "backward"
     dfm["is_lateral"] = dfm["direction"] == "lateral"
     dfm["xt_start"] = dfm.apply(lambda r: xt_value(r["x_start"], r["y_start"]), axis=1)
     dfm["xt_end"] = dfm.apply(lambda r: xt_value(r["x_end"], r["y_end"]), axis=1)
+    # delta_xt only for successful actions (as before)
     dfm["delta_xt"] = np.where(dfm["outcome"].eq("successful"), dfm["xt_end"] - dfm["xt_start"], 0.0)
     dfm["action_distance"] = np.sqrt((dfm["x_end"] - dfm["x_start"]) ** 2 + (dfm["y_end"] - dfm["y_start"]) ** 2)
     dfs_by_match[match_name] = dfm
@@ -344,13 +338,11 @@ def compute_stats(df: pd.DataFrame) -> dict:
     forward_total = int(df["is_forward"].sum())
     backward_total = int(df["is_backward"].sum())
     lateral_total = int(df["is_lateral"].sum())
-    # xT metrics (only for successful actions)
     xt_total_sum = float(df.loc[df["outcome"] == "successful", "delta_xt"].sum())
     xt_total_mean = float(df.loc[df["outcome"] == "successful", "delta_xt"].mean()) if (df["outcome"] == "successful").any() else 0.0
     positive_xt_mask = (df["outcome"] == "successful") & (df["delta_xt"] > 0)
     positive_xt_total = int(positive_xt_mask.sum())
     positive_xt_sum = float(df.loc[positive_xt_mask, "delta_xt"].sum()) if positive_xt_total else 0.0
-    positive_xt_mean = float(df.loc[positive_xt_mask, "delta_xt"].mean()) if positive_xt_total else 0.0
     return {
         "total_actions": total_actions,
         "successful_actions": successful,
@@ -363,62 +355,55 @@ def compute_stats(df: pd.DataFrame) -> dict:
         "xt_total_mean": round(xt_total_mean, 4),
         "positive_xt_total": positive_xt_total,
         "positive_xt_sum": round(positive_xt_sum, 4),
-        "positive_xt_mean": round(positive_xt_mean, 4),
     }
 
-# Draw functions
-FIG_W, FIG_H = 7.9, 5.3
-FIG_DPI = 110
-TOP_N = 20
-
-def draw_action_map(df: pd.DataFrame, title: str):
+# ==========================
+# Draw functions (clean map: no end 'x', smaller start dot)
+# ==========================
+def draw_action_map(df: pd.DataFrame, title: str, top_n_highlight: int = 20):
     pitch = Pitch(pitch_type="statsbomb", pitch_color="#1a1a2e", line_color="#ffffff", line_alpha=0.95)
     fig, ax = pitch.draw(figsize=(FIG_W, FIG_H))
     fig.set_facecolor("#1a1a2e")
     fig.set_dpi(FIG_DPI)
     ax.axvline(x=FINAL_THIRD_LINE_X, color="#FFD54F", linewidth=1.0, alpha=0.20)
     ax.axvline(x=HALF_LINE_X, color="#ffffff", linewidth=0.6, alpha=0.12, linestyle="--")
-    START_DOT_SIZE = 45
 
-    # determine top-N actions by delta_xt (descending)
+    # identify top N (by delta_xt among successful)
     top_idxs = set()
     if not df.empty:
-        df_sorted = df.sort_values(by="delta_xt", ascending=False)
-        top_idxs = set(df_sorted.head(TOP_N).index.tolist())
+        df_success = df[df["outcome"] == "successful"]
+        if not df_success.empty:
+            top_idxs = set(df_success.sort_values("delta_xt", ascending=False).head(top_n_highlight).index.tolist())
 
     for idx, row in df.iterrows():
         is_lost = not row["is_won"]
-        has_vid = has_video_value(row["video"])
-        # color logic:
+        # color & alpha
         if is_lost:
             color = COLOR_FAIL
             alpha = 0.88
         else:
             if idx in top_idxs:
                 color = COLOR_TOP
-                alpha = 0.92
+                alpha = 0.95
             else:
                 color = COLOR_OTHER
-                alpha = 0.18
-        # draw arrow
+                alpha = 0.20
+        # arrows without end marker
         pitch.arrows(row["x_start"], row["y_start"], row["x_end"], row["y_end"],
-                     color=color, width=1.55, headwidth=2.25, headlength=2.25,
+                     color=color, width=1.6, headwidth=2.5, headlength=2.5,
                      ax=ax, zorder=3, alpha=alpha)
-        # start dot
-        if has_vid:
-            pitch.scatter(row["x_start"], row["y_start"], s=95, marker="o", facecolors="none",
-                          edgecolors="#FFD54F", linewidths=2.0, ax=ax, zorder=5)
+        # start dot smaller
+        if has_video_value(row["video"]):
+            pitch.scatter(row["x_start"], row["y_start"], s=70, marker="o", facecolors="none",
+                          edgecolors="#FFD54F", linewidths=2.0, ax=ax, zorder=5, alpha=alpha)
         pitch.scatter(row["x_start"], row["y_start"], s=START_DOT_SIZE, marker="o", color=color,
-                      edgecolors="white", linewidths=0.8, ax=ax, zorder=6, alpha=alpha)
-        # mark end of action
-        pitch.scatter(row["x_end"], row["y_end"], s=30, marker="x", color=color, ax=ax, zorder=5, alpha=0.95)
+                      edgecolors="white", linewidths=0.7, ax=ax, zorder=6, alpha=alpha)
 
     ax.set_title(title, fontsize=12, color="#ffffff", pad=8)
     legend_elements = [
-        Line2D([0], [0], color=COLOR_TOP, lw=2.5, label=f"Top {TOP_N} ΔxT (successful)"),
+        Line2D([0], [0], color=COLOR_TOP, lw=2.5, label=f"Top ΔxT (highlight)"),
         Line2D([0], [0], color=COLOR_OTHER, lw=2.5, label="Other successful"),
         Line2D([0], [0], color=COLOR_FAIL, lw=2.5, label="Failed"),
-        Line2D([0], [0], marker='x', color='w', label='End of action', markerfacecolor='w', markeredgecolor='w', markersize=6),
     ]
     legend = ax.legend(handles=legend_elements, loc="upper left", bbox_to_anchor=(0.01, 0.99),
                        frameon=True, facecolor="#1a1a2e", edgecolor="#444466", shadow=False,
@@ -503,20 +488,25 @@ with col_filters:
     st.markdown("### 🏟️ Match Selection")
     selected_match = st.selectbox("Choose the match", list(full_data.keys()), index=0)
     st.markdown('<hr class="filter-divider">', unsafe_allow_html=True)
-    st.markdown("### 🎯 Action Filter")
+    st.markdown("### 🎯 Action Filter (map will SHOW ONLY the selected set)")
     action_filter = st.radio(
-        "Filter actions",
+        "Filter actions to display",
         [
-            "All Actions",
-            "Successful Only",
-            "Unsuccessful Only",
-            "Positive xT Only (Successful)",
+            "Top N actions (ΔxT)",
+            "Unsuccessful actions",
+            "Successful actions",
+            "Positive xT only (successful)",
+            "High xT only (successful)"
         ],
         index=0,
     )
+    st.markdown("<div style='margin-top:8px; color:#e6e6e6;'>Top N / High xT controls</div>", unsafe_allow_html=True)
+    top_n = st.number_input("Top N (for Top N actions)", min_value=1, max_value=100, value=20, step=1)
+    xt_threshold = st.slider("High xT threshold (ΔxT) — show successful actions with ΔxT ≥",
+                             min_value=0.0, max_value=0.5, value=0.03, step=0.005)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# session state
+# session state for heat selection
 if "heat_selection" not in st.session_state:
     st.session_state["heat_selection"] = None
 if "last_match" not in st.session_state:
@@ -534,19 +524,29 @@ if st.session_state["last_filter"] != action_filter:
 
 with col_field:
     df_base = full_data[selected_match].copy()
-    if action_filter == "All Actions":
-        df_base = df_base.reset_index(drop=True)
-    elif action_filter == "Successful Only":
-        df_base = df_base[df_base["is_won"]].reset_index(drop=True)
-    elif action_filter == "Unsuccessful Only":
-        df_base = df_base[~df_base["is_won"]].reset_index(drop=True)
-    elif action_filter == "Positive xT Only (Successful)":
+
+    # Apply selected display filter (this determines which rows are drawn)
+    if action_filter == "Top N actions (ΔxT)":
+        # choose top N among successful by delta_xt (descending)
+        df_success = df_base[df_base["outcome"] == "successful"].copy()
+        if not df_success.empty:
+            df_sorted = df_success.sort_values("delta_xt", ascending=False).head(int(top_n))
+            df_base = df_sorted.reset_index(drop=True)
+        else:
+            df_base = df_success.reset_index(drop=True)
+    elif action_filter == "Unsuccessful actions":
+        df_base = df_base[df_base["outcome"] == "failed"].reset_index(drop=True)
+    elif action_filter == "Successful actions":
+        df_base = df_base[df_base["outcome"] == "successful"].reset_index(drop=True)
+    elif action_filter == "Positive xT only (successful)":
         df_base = df_base[(df_base["outcome"] == "successful") & (df_base["delta_xt"] > 0)].reset_index(drop=True)
+    elif action_filter == "High xT only (successful)":
+        df_base = df_base[(df_base["outcome"] == "successful") & (df_base["delta_xt"] >= float(xt_threshold))].reset_index(drop=True)
 
     DISPLAY_WIDTH = 780
     pass_map_placeholder = st.empty()
 
-    # Heatmap
+    # ---- Heatmap (render & handle click first) ----
     st.markdown('<h4 style="color:#ffffff; margin:6px 0 6px 0;">Zone Heatmap</h4>', unsafe_allow_html=True)
     heat_img, hax, hfig = draw_corridor_heatmap(df_base)
     heat_click = streamlit_image_coordinates(heat_img, width=DISPLAY_WIDTH)
@@ -570,14 +570,15 @@ with col_field:
         else:
             cname = "center"; y0, y1 = LANE_RIGHT_MAX, LANE_LEFT_MIN
         st.session_state["heat_selection"] = {"ix": int(ix), "corridor": cname, "x0": float(x0), "x1": float(x1), "y0": float(y0), "y1": float(y1)}
-    plt.close(hfig)  # free memory
+    plt.close(hfig)
 
-    # Action map placeholder (title + clear)
+    # ---- Render Action Map placeholder: title + clear button ----
     with pass_map_placeholder.container():
         st.markdown('<h4 style="color:#ffffff; margin:0 0 6px 0;">Action Map</h4>', unsafe_allow_html=True)
         if st.button("Limpar filtro do quadrante", key="clear_heat_filter"):
             st.session_state["heat_selection"] = None
 
+        # apply heat selection filter on top of the main filter (if any)
         df_to_draw = df_base
         if st.session_state["heat_selection"] is not None:
             sel = st.session_state["heat_selection"]
@@ -588,8 +589,8 @@ with col_field:
                 & (df_base["y_end"] < sel["y1"])
             ].reset_index(drop=True)
 
-        # Draw action map
-        img_obj, ax, fig = draw_action_map(df_to_draw, title=f"Action Map — {selected_match}")
+        # Draw action map. For highlighting top N inside the drawn set we pass top_n
+        img_obj, ax, fig = draw_action_map(df_to_draw, title=f"Action Map — {selected_match}", top_n_highlight=int(top_n))
         click = streamlit_image_coordinates(img_obj, width=DISPLAY_WIDTH)
 
     selected_action = None
@@ -610,7 +611,7 @@ with col_field:
             selected_action = candidates.iloc[0]
     plt.close(fig)
 
-    # heat selection info
+    # display heat selection info
     if st.session_state["heat_selection"] is not None:
         sel = st.session_state["heat_selection"]
         sel_mask = (
@@ -626,7 +627,7 @@ with col_field:
             unsafe_allow_html=True,
         )
 
-    # Selected Action and table
+    # ---- Selected Action and data table ----
     st.divider()
     st.subheader("Selected Action")
     if selected_action is None:
@@ -644,7 +645,7 @@ with col_field:
         tag1, tag2, tag3 = st.columns(3)
         tag1.write(f"**Direction:** {emoji} {direction_label}")
         tag2.write(f"**Successful:** {'✅' if selected_action['is_won'] else '❌'}")
-        tag3.write(f"")
+        tag3.write("")
         xt_col1, xt_col2, xt_col3, xt_col4 = st.columns(4)
         xt_col1.metric("Distance", f"{selected_action['action_distance']:.1f}m")
         xt_col2.metric("xT Start", f"{selected_action['xt_start']:.4f}")
