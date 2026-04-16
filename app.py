@@ -1,4 +1,10 @@
-# name=pass_map_actions_xt_clean.py
+# Action Map — Clean (Actions + xT) — v2
+# Changes:
+# - "All Actions" as first/default filter option (keeps other filters)
+# - Advanced Statistics: sum of positive ΔxT, mean ΔxT for positive actions, % positive actions
+# - Table with Top 5 ΔxT positives
+# - Count of failed ("erradas") actions and xT "contrário" (sum/mean of xt_start for failed actions)
+# - Keeps clean map: no end 'x', smaller start dot, top-N highlight
 import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
@@ -128,7 +134,7 @@ COLOR_OTHER = "#bfc4ca"      # other successful (light gray)
 COLOR_FAIL = "#FF6B6B"       # failed (light red)
 
 # Draw sizes
-START_DOT_SIZE = 30  # decreased
+START_DOT_SIZE = 28  # slightly decreased
 FIG_W, FIG_H = 7.9, 5.3
 FIG_DPI = 110
 
@@ -338,11 +344,23 @@ def compute_stats(df: pd.DataFrame) -> dict:
     forward_total = int(df["is_forward"].sum())
     backward_total = int(df["is_backward"].sum())
     lateral_total = int(df["is_lateral"].sum())
-    xt_total_sum = float(df.loc[df["outcome"] == "successful", "delta_xt"].sum())
-    xt_total_mean = float(df.loc[df["outcome"] == "successful", "delta_xt"].mean()) if (df["outcome"] == "successful").any() else 0.0
-    positive_xt_mask = (df["outcome"] == "successful") & (df["delta_xt"] > 0)
-    positive_xt_total = int(positive_xt_mask.sum())
-    positive_xt_sum = float(df.loc[positive_xt_mask, "delta_xt"].sum()) if positive_xt_total else 0.0
+    # xT metrics (only for successful actions)
+    pos_mask = (df["outcome"] == "successful") & (df["delta_xt"] > 0)
+    pos_count = int(pos_mask.sum())
+    pos_sum = float(df.loc[pos_mask, "delta_xt"].sum()) if pos_count else 0.0
+    pos_mean = float(df.loc[pos_mask, "delta_xt"].mean()) if pos_count else 0.0
+    pos_pct = (pos_count / total_actions * 100.0) if total_actions else 0.0
+    # Top 5 positive ΔxT table (successful)
+    top5_df = pd.DataFrame()
+    if pos_count:
+        top5_df = df.loc[pos_mask].sort_values("delta_xt", ascending=False).head(5)[
+            ["number", "type", "x_start", "y_start", "x_end", "y_end", "xt_start", "xt_end", "delta_xt"]
+        ].reset_index(drop=True)
+    # Failed actions xT "contrário": loss of xT opportunity measured by xt_start at failure
+    failed_mask = df["outcome"] == "failed"
+    failed_count = int(failed_mask.sum())
+    failed_xt_lost_sum = float(df.loc[failed_mask, "xt_start"].sum()) if failed_count else 0.0
+    failed_xt_lost_mean = float(df.loc[failed_mask, "xt_start"].mean()) if failed_count else 0.0
     return {
         "total_actions": total_actions,
         "successful_actions": successful,
@@ -351,10 +369,14 @@ def compute_stats(df: pd.DataFrame) -> dict:
         "forward_total": forward_total,
         "backward_total": backward_total,
         "lateral_total": lateral_total,
-        "xt_total_sum": round(xt_total_sum, 4),
-        "xt_total_mean": round(xt_total_mean, 4),
-        "positive_xt_total": positive_xt_total,
-        "positive_xt_sum": round(positive_xt_sum, 4),
+        "positive_xt_count": pos_count,
+        "positive_xt_sum": round(pos_sum, 4),
+        "positive_xt_mean": round(pos_mean, 4),
+        "positive_xt_pct": round(pos_pct, 2),
+        "top5_positive_table": top5_df,
+        "failed_count": failed_count,
+        "failed_xt_lost_sum": round(failed_xt_lost_sum, 4),
+        "failed_xt_lost_mean": round(failed_xt_lost_mean, 4),
     }
 
 # ==========================
@@ -368,7 +390,7 @@ def draw_action_map(df: pd.DataFrame, title: str, top_n_highlight: int = 20):
     ax.axvline(x=FINAL_THIRD_LINE_X, color="#FFD54F", linewidth=1.0, alpha=0.20)
     ax.axvline(x=HALF_LINE_X, color="#ffffff", linewidth=0.6, alpha=0.12, linestyle="--")
 
-    # identify top N (by delta_xt among successful)
+    # identify top N (by delta_xt among successful) within the provided df
     top_idxs = set()
     if not df.empty:
         df_success = df[df["outcome"] == "successful"]
@@ -392,9 +414,9 @@ def draw_action_map(df: pd.DataFrame, title: str, top_n_highlight: int = 20):
         pitch.arrows(row["x_start"], row["y_start"], row["x_end"], row["y_end"],
                      color=color, width=1.6, headwidth=2.5, headlength=2.5,
                      ax=ax, zorder=3, alpha=alpha)
-        # start dot smaller
+        # start dot smaller and less dominant
         if has_video_value(row["video"]):
-            pitch.scatter(row["x_start"], row["y_start"], s=70, marker="o", facecolors="none",
+            pitch.scatter(row["x_start"], row["y_start"], s=68, marker="o", facecolors="none",
                           edgecolors="#FFD54F", linewidths=2.0, ax=ax, zorder=5, alpha=alpha)
         pitch.scatter(row["x_start"], row["y_start"], s=START_DOT_SIZE, marker="o", color=color,
                       edgecolors="white", linewidths=0.7, ax=ax, zorder=6, alpha=alpha)
@@ -492,13 +514,14 @@ with col_filters:
     action_filter = st.radio(
         "Filter actions to display",
         [
+            "All Actions",
             "Top N actions (ΔxT)",
             "Unsuccessful actions",
             "Successful actions",
             "Positive xT only (successful)",
             "High xT only (successful)"
         ],
-        index=0,
+        index=0,  # default All Actions
     )
     st.markdown("<div style='margin-top:8px; color:#e6e6e6;'>Top N / High xT controls</div>", unsafe_allow_html=True)
     top_n = st.number_input("Top N (for Top N actions)", min_value=1, max_value=100, value=20, step=1)
@@ -526,8 +549,9 @@ with col_field:
     df_base = full_data[selected_match].copy()
 
     # Apply selected display filter (this determines which rows are drawn)
-    if action_filter == "Top N actions (ΔxT)":
-        # choose top N among successful by delta_xt (descending)
+    if action_filter == "All Actions":
+        df_base = df_base.reset_index(drop=True)
+    elif action_filter == "Top N actions (ΔxT)":
         df_success = df_base[df_base["outcome"] == "successful"].copy()
         if not df_success.empty:
             df_sorted = df_success.sort_values("delta_xt", ascending=False).head(int(top_n))
@@ -700,17 +724,37 @@ with col_stats:
             small_metric("⬇️ Backward", f"{stats_safe['backward_total']}")
         with dir3:
             small_metric("↔️ Lateral", f"{stats_safe['lateral_total']}")
-    with st.expander("Advanced Statistics (xT)", expanded=False):
+    with st.expander("Advanced Statistics (xT)", expanded=True):
         st.markdown('<div class="stats-section-title">Expected Threat (xT)</div>', unsafe_allow_html=True)
-        xt1, xt2 = st.columns(2)
+        xt1, xt2, xt3 = st.columns(3)
         with xt1:
-            small_metric("xT Σ (successful)", f"{stats_safe['xt_total_sum']:.2f}")
+            small_metric("Σ ΔxT (positive)", f"{stats_safe['positive_xt_sum']:.4f}")
         with xt2:
-            small_metric("xT Mean (successful)", f"{stats_safe['xt_total_mean']:.4f}")
-        xt3, xt4 = st.columns(2)
+            small_metric("Mean ΔxT (positive)", f"{stats_safe['positive_xt_mean']:.4f}")
         with xt3:
-            small_metric("Count ΔxT > 0", f"{stats_safe['positive_xt_total']}")
-        with xt4:
-            small_metric("xT Σ (ΔxT > 0)", f"{stats_safe['positive_xt_sum']:.2f}")
+            small_metric("% Actions ΔxT > 0", f"{stats_safe['positive_xt_pct']:.1f}%")
+        st.markdown("<hr style='margin:6px 0 8px 0;'>", unsafe_allow_html=True)
+        st.markdown('<div class="stats-section-title">Top 5 ΔxT (positives)</div>', unsafe_allow_html=True)
+        if not stats_safe["top5_positive_table"].empty:
+            st.dataframe(
+                stats_safe["top5_positive_table"].style.format({
+                    "x_start": "{:.2f}", "y_start": "{:.2f}",
+                    "x_end": "{:.2f}", "y_end": "{:.2f}",
+                    "xt_start": "{:.4f}", "xt_end": "{:.4f}", "delta_xt": "{:.4f}",
+                }),
+                use_container_width=True,
+                height=240,
+            )
+        else:
+            st.write("No positive ΔxT actions to show.")
+        st.markdown("<hr style='margin:6px 0 8px 0;'>", unsafe_allow_html=True)
+        st.markdown('<div class="stats-section-title">Failed actions (xT contrários)</div>', unsafe_allow_html=True)
+        fx1, fx2, fx3 = st.columns(3)
+        with fx1:
+            small_metric("Failed actions", f"{stats_safe['failed_count']}")
+        with fx2:
+            small_metric("Σ xT (start) — failed", f"{stats_safe['failed_xt_lost_sum']:.4f}")
+        with fx3:
+            small_metric("Mean xT (start) — failed", f"{stats_safe['failed_xt_lost_mean']:.4f}")
     st.divider()
-    st.caption("Notas: ΔxT é contabilizado apenas para ações bem-sucedidas.")
+    st.caption("Notas: ΔxT é contabilizado apenas para ações bem-sucedidas; 'xT contrários' = soma/ média de xT do ponto inicial de ações falhadas (indica perda de posse em zonas perigosas).")
