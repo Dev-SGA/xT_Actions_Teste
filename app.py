@@ -1,10 +1,4 @@
-# Action Map — Clean (Actions + xT) — v2
-# Changes:
-# - "All Actions" as first/default filter option (keeps other filters)
-# - Advanced Statistics: sum of positive ΔxT, mean ΔxT for positive actions, % positive actions
-# - Table with Top 5 ΔxT positives
-# - Count of failed ("erradas") actions and xT "contrário" (sum/mean of xt_start for failed actions)
-# - Keeps clean map: no end 'x', smaller start dot, top-N highlight
+# Action Map — Clean (Actions + xT) — v2 (updated to use funnel-based xT measurement)
 import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
@@ -18,6 +12,8 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, Rectangle
 from streamlit_image_coordinates import streamlit_image_coordinates
 from matplotlib.colors import Normalize, LinearSegmentedColormap
+from matplotlib.path import Path
+import math
 
 # ==========================
 # Page Configuration
@@ -139,17 +135,198 @@ FIG_W, FIG_H = 7.9, 5.3
 FIG_DPI = 110
 
 # ==========================
-# xT GRID
+# New xT computation (funnel + attenuation + blending)
+# We'll compute a high-res continuous xT, apply funnel-based bonus with attenuation,
+# blend around the funnel border, then aggregate to the app's NXxNY grid.
+# The result is cached to avoid recomputation on each rerun.
 # ==========================
-x_progress = np.linspace(0.01, 1.00, NX)
-y_central = 1 - np.abs(np.linspace(0, 1, NY) - 0.5) * 2
+@st.cache_data(show_spinner=False)
+def compute_xt_grid(
+    NX=16,
+    NY=12,
+    sub=24,                       # subdivisions per coarse cell (higher => more precise, slower)
+    goal_width=11.0,
+    penalty_depth=18.5,
+    penalty_width=45.32,
+    prox_w=0.65,
+    central_w=0.35,
+    att_min=0.45,
+    att_prox_weight=0.7,
+    att_central_weight=0.3,
+    band_width_m=8.0,
+    blur_window_m=6.0,
+):
+    # Build high-res grid
+    ncols_hr = NX * sub
+    nrows_hr = NY * sub
 
-XT_GRID = np.zeros((NY, NX))
-for iy in range(NY):
-    for ix in range(NX):
-        XT_GRID[iy, ix] = 0.80 * x_progress[ix] + 0.20 * x_progress[ix] * y_central[iy]
-XT_GRID = (XT_GRID - XT_GRID.min()) / (XT_GRID.max() - XT_GRID.min() + 1e-9)
+    x_edges_hr = np.linspace(0.0, FIELD_X, ncols_hr + 1)
+    y_edges_hr = np.linspace(0.0, FIELD_Y, nrows_hr + 1)
+    x_centers_hr = (x_edges_hr[:-1] + x_edges_hr[1:]) / 2.0
+    y_centers_hr = (y_edges_hr[:-1] + y_edges_hr[1:]) / 2.0
+    Xc_hr, Yc_hr = np.meshgrid(x_centers_hr, y_centers_hr)
 
+    # base continuous xT (same form as original)
+    xp = 0.01 + (Xc_hr / FIELD_X) * (1.0 - 0.01)
+    yc = 1.0 - np.abs((Yc_hr / FIELD_Y) - 0.5) * 2.0
+    XT_RAW_hr = xp * (0.8 + 0.2 * yc)
+    # normalize base
+    XT_RAW_hr = (XT_RAW_hr - XT_RAW_hr.min()) / (XT_RAW_hr.max() - XT_RAW_hr.min() + 1e-12)
+
+    # define funnel polygon (same geometry as you set)
+    center_y = FIELD_Y / 2.0
+    left_goal_post = (FIELD_X, center_y - goal_width / 2.0)
+    right_goal_post = (FIELD_X, center_y + goal_width / 2.0)
+    x_big = FIELD_X - penalty_depth
+    big_top_corner = (x_big, center_y + penalty_width / 2.0)
+    big_bottom_corner = (x_big, center_y - penalty_width / 2.0)
+    funnel_vertices = [left_goal_post, big_bottom_corner, big_top_corner, right_goal_post]
+    funnel_path = Path(funnel_vertices)
+
+    # rasterize funnel mask
+    pts = np.column_stack([Xc_hr.ravel(), Yc_hr.ravel()])
+    inside_flags = funnel_path.contains_points(pts).reshape(Xc_hr.shape)
+
+    # proximity & centrality maps
+    goal_center = (FIELD_X, center_y)
+    D_hr = np.hypot(goal_center[0] - Xc_hr, goal_center[1] - Yc_hr)
+    max_dist = np.hypot(FIELD_X - 0.0, FIELD_Y / 2.0)
+    prox_hr = 1.0 - np.clip(D_hr / max_dist, 0.0, 1.0)
+    central_hr = 1.0 - np.clip(np.abs((Yc_hr - center_y) / center_y), 0.0, 1.0)
+
+    # unit bonus (weight=1) inside funnel
+    unit_bonus_hr = (prox_w * prox_hr + central_w * central_hr) * inside_flags.astype(float)
+
+    # attenuation factor (reduces bonus in far / lateral positions)
+    att_score_hr = (att_prox_weight * prox_hr + att_central_weight * central_hr)
+    att_hr = att_min + (1.0 - att_min) * att_score_hr
+    att_hr = np.clip(att_hr, att_min, 1.0)
+    att_effective_hr = att_hr * inside_flags.astype(float)
+    unit_bonus_eff_hr = unit_bonus_hr * att_effective_hr
+
+    # compute minimal weight to ensure inside_min > outside_max (min necessary)
+    base_hr = XT_RAW_hr
+    inside_base_vals = base_hr[inside_flags]
+    outside_base_vals = base_hr[~inside_flags]
+    outside_max = outside_base_vals.max() if outside_base_vals.size > 0 else -np.inf
+
+    if inside_base_vals.size == 0:
+        chosen_weight = 0.0
+    else:
+        base_inside_min = inside_base_vals.min()
+        unit_eff_inside = unit_bonus_eff_hr[inside_flags]
+        min_unit_eff_inside = unit_eff_inside.min() if unit_eff_inside.size > 0 else 0.0
+        if min_unit_eff_inside <= 1e-12:
+            chosen_weight = 0.0
+        else:
+            required_weight = (outside_max + 1e-12 - base_inside_min) / min_unit_eff_inside
+            chosen_weight = max(0.0, required_weight) + 1e-12
+
+    # apply bonus with chosen_weight
+    bonus_hr = chosen_weight * unit_bonus_eff_hr
+    XT_MOD_hr = base_hr + bonus_hr
+
+    # small fallback shift if still violated (rare)
+    inside_vals = XT_MOD_hr[inside_flags]
+    outside_vals = XT_MOD_hr[~inside_flags]
+    outside_max = outside_vals.max() if outside_vals.size > 0 else -np.inf
+    inside_min = inside_vals.min() if inside_vals.size > 0 else np.inf
+    if inside_min <= outside_max + 1e-12:
+        shift = (outside_max + 1e-12) - inside_min
+        XT_MOD_hr[inside_flags] = XT_MOD_hr[inside_flags] + shift
+
+    # --- smoothing: box blur used as blend reference
+    px_w = FIELD_X / ncols_hr
+    px_h = FIELD_Y / nrows_hr
+    rx = max(1, int(round((blur_window_m / px_w) / 2.0)))
+    ry = max(1, int(round((blur_window_m / px_h) / 2.0)))
+
+    def box_blur_2d(arr, rx, ry):
+        H, W = arr.shape
+        pad = ((ry, ry), (rx, rx))
+        a = np.pad(arr, pad_width=pad, mode='edge').astype(np.float64)
+        ii = a.cumsum(axis=0).cumsum(axis=1)
+        s = ii[2*ry : 2*ry + H, 2*rx : 2*rx + W].copy()
+        s += ii[0:H, 0:W]
+        s -= ii[0:H, 2*rx : 2*rx + W]
+        s -= ii[2*ry : 2*ry + H, 0:W]
+        return s / ((2*ry+1) * (2*rx+1))
+
+    smoothed_hr = box_blur_2d(XT_MOD_hr, rx, ry)
+
+    # compute distance to funnel boundary (sampling boundary densely)
+    boundary_pts = []
+    for i in range(len(funnel_vertices)):
+        a = funnel_vertices[i]
+        b = funnel_vertices[(i + 1) % len(funnel_vertices)]
+        dx = b[0] - a[0]
+        dy = b[1] - a[1]
+        edge_len = math.hypot(dx, dy)
+        num = max(2, int(round(edge_len / 0.5)))
+        for t in np.linspace(0.0, 1.0, num, endpoint=False):
+            px = a[0] + dx * t
+            py = a[1] + dy * t
+            boundary_pts.append((px, py))
+    boundary_pts = np.array(boundary_pts)
+
+    flat_X = Xc_hr.ravel()
+    flat_Y = Yc_hr.ravel()
+    N = flat_X.size
+    min_d2 = np.full(N, np.inf, dtype=np.float64)
+    for bp in boundary_pts:
+        dx = flat_X - bp[0]
+        dy = flat_Y - bp[1]
+        d2 = dx * dx + dy * dy
+        mask = d2 < min_d2
+        if mask.any():
+            min_d2[mask] = d2[mask]
+    min_dist = np.sqrt(min_d2).reshape(Xc_hr.shape)
+
+    abs_dist = min_dist
+    w = np.clip(abs_dist / band_width_m, 0.0, 1.0)
+    XT_BLENDED_hr = w * XT_MOD_hr + (1.0 - w) * smoothed_hr
+    XT_COMBINED_hr = XT_BLENDED_hr
+
+    # final tiny shift safeguard
+    inside_vals_final_pre = XT_COMBINED_hr[inside_flags]
+    outside_vals_final_pre = XT_COMBINED_hr[~inside_flags]
+    outside_max_pre = outside_vals_final_pre.max() if outside_vals_final_pre.size > 0 else -np.inf
+    inside_min_pre = inside_vals_final_pre.min() if inside_vals_final_pre.size > 0 else np.inf
+    if inside_min_pre <= outside_max_pre + 1e-12:
+        shift = (outside_max_pre + 1e-12) - inside_min_pre
+        XT_COMBINED_hr[inside_flags] += shift
+
+    # normalize final high-res field
+    hr_min = XT_COMBINED_hr.min()
+    hr_max = XT_COMBINED_hr.max()
+    XT_FINAL_hr = (XT_COMBINED_hr - hr_min) / (hr_max - hr_min + 1e-12)
+
+    # aggregate to coarse NXxNY by averaging blocks
+    XT_coarse = np.zeros((NY, NX))
+    for iy in range(NY):
+        for ix in range(NX):
+            r0 = iy * sub
+            r1 = (iy + 1) * sub
+            c0 = ix * sub
+            c1 = (ix + 1) * sub
+            block = XT_FINAL_hr[r0:r1, c0:c1]
+            XT_coarse[iy, ix] = block.mean()
+
+    # normalize coarse again (safe)
+    XT_coarse = (XT_coarse - XT_coarse.min()) / (XT_coarse.max() - XT_coarse.min() + 1e-12)
+
+    return XT_coarse, XT_FINAL_hr, inside_flags
+
+# Replace old static XT_GRID with computed one
+XT_GRID, XT_FINAL_hr_cached, INSIDE_MASK_FINAL_HR = compute_xt_grid(
+    NX=NX, NY=NY, sub=24,
+    goal_width=11.0, penalty_depth=18.5, penalty_width=45.32,
+    prox_w=0.65, central_w=0.35, att_min=0.45,
+    att_prox_weight=0.7, att_central_weight=0.3,
+    band_width_m=8.0, blur_window_m=6.0
+)
+
+# Keep xt lookup semantics: zone_index and xt_value
 def zone_index(x, y):
     x = np.clip(x, 0, FIELD_X - 1e-9)
     y = np.clip(y, 0, FIELD_Y - 1e-9)
@@ -159,10 +336,10 @@ def zone_index(x, y):
 
 def xt_value(x, y):
     ix, iy = zone_index(x, y)
-    return XT_GRID[iy, ix]
+    return float(XT_GRID[iy, ix])
 
 # ==========================
-# DATA (user-provided actions)
+# DATA (user-provided actions)  — unchanged
 # ==========================
 matches_data = {
     "Ali vs Vancouver": [
@@ -291,6 +468,7 @@ matches_data = {
 
 # ==========================
 # Helpers, DataFrames, Stats, Draw functions
+# (unchanged logic; xt_start/xt_end derived from new XT_GRID)
 # ==========================
 def has_video_value(v) -> bool:
     return pd.notna(v) and str(v).strip() != ""
@@ -325,9 +503,9 @@ for match_name, events in matches_data.items():
     dfm["is_forward"] = dfm["direction"] == "forward"
     dfm["is_backward"] = dfm["direction"] == "backward"
     dfm["is_lateral"] = dfm["direction"] == "lateral"
+    # xt_start/xt_end use the new XT_GRID via xt_value()
     dfm["xt_start"] = dfm.apply(lambda r: xt_value(r["x_start"], r["y_start"]), axis=1)
     dfm["xt_end"] = dfm.apply(lambda r: xt_value(r["x_end"], r["y_end"]), axis=1)
-    # delta_xt only for successful actions (as before)
     dfm["delta_xt"] = np.where(dfm["outcome"].eq("successful"), dfm["xt_end"] - dfm["xt_start"], 0.0)
     dfm["action_distance"] = np.sqrt((dfm["x_end"] - dfm["x_start"]) ** 2 + (dfm["y_end"] - dfm["y_start"]) ** 2)
     dfs_by_match[match_name] = dfm
@@ -381,6 +559,7 @@ def compute_stats(df: pd.DataFrame) -> dict:
 
 # ==========================
 # Draw functions (clean map: no end 'x', smaller start dot)
+# (unchanged)
 # ==========================
 def draw_action_map(df: pd.DataFrame, title: str, top_n_highlight: int = 20):
     pitch = Pitch(pitch_type="statsbomb", pitch_color="#1a1a2e", line_color="#ffffff", line_alpha=0.95)
@@ -500,9 +679,8 @@ def draw_corridor_heatmap(df: pd.DataFrame, title: str = "Zone Heatmap — Compl
 
 # ==========================
 # Layout: Filters / Field / Stats
+# (rest of app unchanged; uses XT_GRID via xt_value)
 # ==========================
-st.caption("Click the start dot to select the action event.")
-
 col_filters, col_field, col_stats = st.columns([0.9, 2, 1], gap="large")
 
 with col_filters:
